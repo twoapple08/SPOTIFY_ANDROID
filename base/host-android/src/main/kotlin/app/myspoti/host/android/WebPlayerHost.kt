@@ -228,6 +228,33 @@ class WebPlayerHost(private val context: Context) : BridgeHost {
         purgeRemovedProfiles()
     }
 
+    // EXPERIMENTAL: Spotify's login should see the WebView's real Android identity.
+    // The desktop identity is needed only by the Web Player after sign-in.
+    private var nativeLoginUserAgent: String = ""
+    private var nativeLoginMetadata: androidx.webkit.UserAgentMetadata? = null
+    private var desktopPlayerMetadata: androidx.webkit.UserAgentMetadata? = null
+    private var loginBrowserActive = false
+
+    private fun useNativeLoginBrowser() {
+        if (loginBrowserActive) return
+        loginBrowserActive = true
+        view.settings.userAgentString = nativeLoginUserAgent
+        if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.USER_AGENT_METADATA)) {
+            nativeLoginMetadata?.let { androidx.webkit.WebSettingsCompat.setUserAgentMetadata(view.settings, it) }
+        }
+        Logbook.log("login browser: native Android WebView UA and client hints")
+    }
+
+    private fun useDesktopPlayerBrowser() {
+        if (!loginBrowserActive) return
+        loginBrowserActive = false
+        view.settings.userAgentString = fingerprint.userAgent
+        if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.USER_AGENT_METADATA)) {
+            desktopPlayerMetadata?.let { androidx.webkit.WebSettingsCompat.setUserAgentMetadata(view.settings, it) }
+        }
+        Logbook.log("player browser: desktop UA restored")
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     var view: WebView = createView()
 
@@ -240,6 +267,12 @@ class WebPlayerHost(private val context: Context) : BridgeHost {
     private fun createView(): WebView = AwakeWebView(android.content.MutableContextWrapper(context.applicationContext)).apply {
         // The account's profile, before anything else is done with the view (androidx.webkit's rule).
         useProfile(this)
+        // Capture both the real UA and its matching client hints before overriding them.
+        nativeLoginUserAgent = settings.userAgentString
+        nativeLoginMetadata = if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.USER_AGENT_METADATA)) {
+            androidx.webkit.WebSettingsCompat.getUserAgentMetadata(settings)
+        } else null
+        loginBrowserActive = false
         settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -266,7 +299,7 @@ class WebPlayerHost(private val context: Context) : BridgeHost {
             val brands = fingerprint.brands.map {
                 androidx.webkit.UserAgentMetadata.BrandVersion.Builder().setBrand(it.name).setMajorVersion(it.major).setFullVersion(it.fullVersion).build()
             }
-            androidx.webkit.WebSettingsCompat.setUserAgentMetadata(settings, androidx.webkit.UserAgentMetadata.Builder()
+            desktopPlayerMetadata = androidx.webkit.UserAgentMetadata.Builder()
                 .setBrandVersionList(brands)
                 .setFullVersion(fingerprint.fullVersion)
                 .setPlatform("Linux")
@@ -276,7 +309,8 @@ class WebPlayerHost(private val context: Context) : BridgeHost {
                 .setMobile(false)
                 .setModel("")
                 .setWow64(false)
-                .build())
+                .build()
+            desktopPlayerMetadata?.let { androidx.webkit.WebSettingsCompat.setUserAgentMetadata(settings, it) }
         }
         // The page plays the audio: its renderer keeps its priority when the screen is off.
         setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
@@ -374,6 +408,8 @@ class WebPlayerHost(private val context: Context) : BridgeHost {
                 if (!isLoginPage(url) && _loginLoad.value != LoginLoad.NONE && _loginLoad.value != LoginLoad.FAILED) setLoginLoad(LoginLoad.NONE)
                 _url.value = url
                 _loginRequired.value = isLoginPage(url)
+                // A script-driven redirect may skip shouldOverrideUrlLoading.
+                if (url.startsWith(PLAYER_URL) && loginBrowserActive) useDesktopPlayerBrowser()
                 if (url.startsWith(PLAYER_URL)) { drmAsked = false; licenseAnswersLogged = 0; onPageStarting?.invoke(); armChannels(view, renew = true); relay.injectNow() }
                 if (PLAYER_ROOT.matches(url) && url != roots.getString(ROOT_KEY, null)) roots.edit().putString(ROOT_KEY, url).apply()
             }
@@ -450,6 +486,18 @@ class WebPlayerHost(private val context: Context) : BridgeHost {
                 // And only over https: a plain http link to those hosts, or any other scheme, stays out.
                 // The page's own loads (loadUrl, about:blank) do not come through here.
                 val secure = request.url.scheme == "https"
+                if (secure && allowed && request.isForMainFrame) {
+                    if (host == "accounts.spotify.com" && !loginBrowserActive) {
+                        useNativeLoginBrowser()
+                        view.loadUrl(request.url.toString())
+                        return true
+                    }
+                    if (host == PLAYER_HOST && loginBrowserActive) {
+                        useDesktopPlayerBrowser()
+                        view.loadUrl(request.url.toString())
+                        return true
+                    }
+                }
                 // A sign-in step that goes nowhere looks like a page that does nothing: say which host was refused.
                 if (!allowed || !secure) Logbook.log("navigation refused: ${host.ifEmpty { request.url.scheme.orEmpty() }}${if (allowed && !secure) " (${request.url.scheme}, not https)" else ""}")
                 return !(allowed && secure)
@@ -797,6 +845,7 @@ class WebPlayerHost(private val context: Context) : BridgeHost {
 
     /** The sign-in page was asked for: kept out of sight, with its clocks running, until it has content. */
     private fun beginLoginLoad() {
+        useNativeLoginBrowser()
         loginProbes = 0
         loginReloaded = false
         main.removeCallbacks(loginProbe)
