@@ -1,6 +1,8 @@
 name: Build MySpoti Test APK
 
 on:
+  push:
+    branches: [login-webview-test]
   workflow_dispatch:
 
 permissions:
@@ -19,6 +21,11 @@ jobs:
         with:
           packages: 'platforms;android-37.0 build-tools;36.0.0'
       - uses: gradle/actions/setup-gradle@v4
+      - name: Keep test APK signing key across runs
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: myspoti-debug-signing-v1
       - name: Build debug APK
         working-directory: base
         run: bash ./gradlew :app:assembleDebug --no-daemon
